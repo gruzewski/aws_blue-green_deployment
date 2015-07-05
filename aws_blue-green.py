@@ -15,7 +15,7 @@ import logging
 import os
 
 # AWS Boto library
-from boto import ec2, route53
+from boto import ec2, route53, exception
 
 # Config file imports
 import aws_config
@@ -34,6 +34,7 @@ try:
     subnet_id = getattr(aws_config, "subnet_id")
     instance_size = getattr(aws_config, "instance_size")
     shutdown_behavior = getattr(aws_config, "shutdown_behavior")
+    dry_run = getattr(aws_config, "dry_run")
 except AttributeError as at_err:
     # Falling back to local variables. Worth to try!
     logging.error('Couldnt read parameters from aws_config.py file. [%s]', at_err)
@@ -97,7 +98,7 @@ def connect_to_AWS(region, aws_access_key, aws_secret_key):
 
     return {'ec2': ec2_conn, 'route53': route53_conn}
 
-def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, instance_name, user_data=None, instance_size='t2.micro', shutdown_behavior='stop'):
+def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, instance_name, user_data=None, instance_size='t2.micro', shutdown_behavior='stop', dry_run=False):
     """
     :param
         ec2_conn: connection to AWS EC2 service
@@ -110,6 +111,7 @@ def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, 
         user_data: Cloud-Init script that will run once
         instance_size: String with instance size
         shutdown_behaviour: stop or termination
+        dry-run: True or False. If True, it will not make any changes.
     :return: instance ID if created or None
     """
     # Checks (by filtering instances currently running) if there is no other instance running with the same tags.
@@ -118,26 +120,62 @@ def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, 
 
     if not instances:
         # If list is not empty. Creates new instance.
-        reservations = ec2_conn.run_instances(image_id,
-                                       key_name=ssh_key,
-                                       user_data=user_data,
-                                       instance_type=instance_size,
-                                       subnet_id=subnet_id,
-                                       security_group_ids=[sec_group],
-                                       instance_initiated_shutdown_behavior=shutdown_behavior)
+        try:
+            reservations = ec2_conn.run_instances(image_id,
+                                           key_name=ssh_key,
+                                           user_data=user_data,
+                                           instance_type=instance_size,
+                                           subnet_id=subnet_id,
+                                           security_group_ids=[sec_group],
+                                           instance_initiated_shutdown_behavior=shutdown_behavior,
+                                           dry_run=dry_run)
 
-        if reservations is not None:
-            # When instance was created, we have to assign tags.
-            reservations.instances[0].add_tag('Name', instance_name)
-            reservations.instances[0].add_tag('Environment', env)
-            reservations.instances[0].add_tag('Deployment Date', time.strftime("%d-%m-%Y"))
-
+            if reservations is not None and not dry_run:
+                # When instance was created, we have to assign tags.
+                reservations.instances[0].add_tag('Name', instance_name)
+                reservations.instances[0].add_tag('Environment', env)
+                reservations.instances[0].add_tag('Deployment Date', time.strftime("%d-%m-%Y"))
+        except exception.EC2ResponseError:
+            print('New instance would be created and this tags should be assigned')
+            print('Name: %s' % instance_name)
+            print('Environment: %s' % env)
+            print('Deployment Date: %s' % time.strftime("%d-%m-%Y"))
+            return 'OK'
     else:
         # Looks like there was another instance running with the same tags.
         logging.warn('There is another instance running with %s environment tag (id: %s).' % (env, instances[0]))
         return None
 
     return reservations.instances
+
+def stop_instance(aws_connection, env, domain, live_alias, dry_run=False):
+
+
+    result = False
+
+    tag = ''.join(old_tag.values())
+
+    # Gets past live instance.
+    instances = aws_connection.get('ec2').get_only_instances(filters={"tag:Environment" : "{0}".format(''.join(env)),
+                                                     "instance-state-name" : "running"})
+
+    if check_which_is_live(aws_connection.get('route53'), domain, live_alias) != (env + "." + domain) and instances:
+        # Instance is not live
+        try:
+            instances[0].remove_tag('Environment')
+            aws_connection.get('ec2').stop_instances(instance_ids=[instances[0].id], dry_run=dry_run)
+            instances[0].add_tag('Environment', '{0}'.format(tag))
+        except exception.EC2ResponseError as ex:
+            print('Instance %s would be stopped and tagged with Environment:%s' % (instances[0].id, tag))
+            print(ex)
+
+        result = True
+    else:
+        logging.error('Couldnt stop old instance.')
+        if dry_run:
+            print('Instance %s would be stopped and tagged with Environment:%s' % (instances[0].id, tag))
+
+    return result
 
 def check_which_is_live(route53_conn, domain, live_alias):
     """
@@ -152,33 +190,56 @@ def check_which_is_live(route53_conn, domain, live_alias):
 
     return live_fqdn
 
-def swap_live_with_staging(route53_conn, domain, current_live, live_alias):
+def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry_run=False):
     """
     :description: Changes alias (blue.<domain> or green.<domain>) that is behind live url.
     :param
-        route53_conn: Connection to AWS Route53 service
+        aws_connection: Connections to AWS Route53 service and EC2
         domain: Your Domain
         current_live: blue.<domain> or green.<domain> depends which is live
         live_alias: Your external DNS record pointing to live web server.
+        dry-run: True or False. If True, it will not make any changes.
     :return: Result of the change (AWS respond).
     """
+    route53_conn = aws_connection.get('route53')
+
     zone = route53_conn.get_zone(domain)
 
     records = route53.record.ResourceRecordSets(connection=route53_conn, hosted_zone_id=zone.id)
 
-    if current_live == blue_alias:
-        # Blue was live so now time for Green.
-        change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=green_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-        change.add_value(green_alias)
-        result = records.commit()
+    if dry_run:
+        if current_live == blue_alias:
+            print('DNS record %s would be updated with %s' % (live_alias, green_alias))
+            stop_instance(aws_connection, 'blue', domain, live_alias, dry_run=dry_run)
+        else:
+            print('DNS record %s would be updated with %s' % (live_alias, blue_alias))
+            stop_instance(aws_connection, 'green', domain, live_alias, dry_run=dry_run)
+
+        result = 'OK'
     else:
-        # This time Green was live. Blue, are you ready?
-        change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=blue_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-        change.add_value(blue_alias)
-        result = records.commit()
+        if current_live == blue_alias:
+            # Blue was live so now time for Green.
+            change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=green_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            change.add_value(green_alias)
+            result = records.commit()
+
+            # Wait TTL and then stop second instance
+            time.sleep(300)
+
+            stop_instance(aws_connection, 'blue', domain, live_alias, dry_run=dry_run)
+        else:
+            # This time Green was live. Blue, are you ready?
+            change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=blue_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            change.add_value(blue_alias)
+            result = records.commit()
+
+            # Wait TTL and then stop second instance
+            time.sleep(600)
+
+            stop_instance(aws_connection, 'green', domain, live_alias, dry_run=dry_run)
     return result
 
-def assign_to_staging(route53_conn, domain, current_live, instance_public_ip):
+def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, dry_run=False):
     """
     :description: Assigns newly created instance to staging url
     :param
@@ -186,34 +247,44 @@ def assign_to_staging(route53_conn, domain, current_live, instance_public_ip):
         domain: Your Domain
         current_live: blue.<domain> or green.<domain> depends which one was behind your live url.
         instance_public_ip: Public IP of newly created instance that would be assigned to staging url.
+        dry-run: True or False. If True, it will not make any changes.
     :return: Result of the change (AWS respond).
     """
     zone = route53_conn.get_zone(domain)
 
     records = route53.record.ResourceRecordSets(connection=route53_conn, hosted_zone_id=zone.id)
 
-    if current_live == green_alias:
-        # Green was live so we are assigning to Blue.
-        change = records.add_change(action='UPSERT', name=blue_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-        change.add_value(instance_public_ip)
-        result = records.commit()
+    if dry_run:
+        if current_live == green_alias:
+            print('Public IP %s would be assigned to %s' % (instance_public_ip, blue_alias))
+        else:
+            print('Public IP %s would be assigned to %s' % (instance_public_ip, green_alias))
 
-        logging.debug(result)
+        result = 'OK'
     else:
-        # Blue was live and Green is going to get new instance!
-        change = records.add_change(action='UPSERT', name=green_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-        change.add_value(instance_public_ip)
-        result = records.commit()
+        if current_live == green_alias:
+            # Green was live so we are assigning to Blue.
+            change = records.add_change(action='UPSERT', name=blue_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            change.add_value(instance_public_ip)
+            result = records.commit()
 
-        logging.debug(result)
+            logging.debug(result)
+        else:
+            # Blue was live and Green is going to get new instance!
+            change = records.add_change(action='UPSERT', name=green_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            change.add_value(instance_public_ip)
+            result = records.commit()
+
+            logging.debug(result)
     return result
 
-def delete_old_instance(ec2_conn, old_tag):
+def delete_old_instance(ec2_conn, old_tag, dry_run=False):
     """
     :description: Deletes instance for given tag only if it is stopped
     :param
         ec2_conn: Connection to AWS EC2 service
         old_tag: Dictionary with <tag_name> <tag_value> pair
+        dry-run: True or False. If True, it will not make any changes.
     :return: boolean status
     """
     result = False
@@ -229,11 +300,16 @@ def delete_old_instance(ec2_conn, old_tag):
         # Double check?
         if old.state == "stopped":
             logging.debug("I am going to delete %s" % old.id)
-            deleted_old = ec2_conn.terminate_instances(instance_ids=[old.id])
-            # Previous line should return instance that was deleted. Worth to check if it was the one we want to delete.
-            if deleted_old[0].id == old.id:
-                logging.info('Deleted %s' % deleted_old[0].id)
-                result = True
+            try:
+                deleted_old = ec2_conn.terminate_instances(instance_ids=[old.id], dry_run=dry_run)
+
+                # Previous line should return instance that was deleted. Worth to check if it was the one we want to delete.
+                if deleted_old[0].id == old.id:
+                    logging.info('Deleted %s' % deleted_old[0].id)
+                    result = True
+            except exception.EC2ResponseError as ex:
+                print('Instance %s would be deleted.' % old.id)
+                print(ex)
         else:
             logging.error('Old instance %s [%s] is not stopped! Reported state was "%s" ' % (old.tags.get('Name'), old.id, old.state))
     else:
@@ -244,7 +320,7 @@ def delete_old_instance(ec2_conn, old_tag):
     return result
 
 def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, blue_url, green_url, old_tag, image_id,
-                     ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior):
+                     ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior, dry_run=False):
     """
     :description: Delivers new instance with staging dns (blue / green).
     :param
@@ -263,13 +339,14 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
         subnet_id: Subnet ID in which your instance should be created
         instance_size: String with instance size
         shutdown_behaviour: stop or termination
+        dry-run: True or False. If True, it will not make any changes.
     :return: string with url and ip address to staging server
     """
     # 1. Connects to AWS
     aws_connections = connect_to_AWS(region, acces_key, secret_key)
 
     # 2. Delete old instance which should be stopped
-    deleted = delete_old_instance(aws_connections.get('ec2'), old_tag)
+    deleted = delete_old_instance(aws_connections.get('ec2'), old_tag, dry_run)
 
     # 3. Check which environment (blue/green) is live
     live = check_which_is_live(aws_connections.get('route53'), domain, live_url)
@@ -279,8 +356,14 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
         env = 'blue'
 
     # 4. If deleted then we can create new instance
-    if deleted:
-        staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior)
+    if dry_run:
+        # Dry Run
+        staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
+        assign_to_staging(aws_connections.get('route53'), domain, live, "127.0.0.1", dry_run)
+        swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
+        sys.exit(0)
+    elif deleted:
+        staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
 
     # 5. Assign right dns alias only if we managed to create instance in previous step
     if staging_instance is None:
@@ -311,9 +394,11 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
             # Or maybe it is? :)
             public_ip = staging_instance[0].ip_address
 
-        assign_to_staging(aws_connections.get('route53'), domain, live, public_ip)
+        assign_to_staging(aws_connections.get('route53'), domain, live, public_ip, dry_run)
+
+        swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
 
     return str(env + "." + domain + ": " + public_ip)
 
 print(deployment_stage(region, aws_access_key, aws_secret_key, web_srv_name, domain, live_alias, blue_alias, green_alias,
-                 old_tag, image_id, ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior))
+                 old_tag, image_id, ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior, dry_run))

@@ -11,3 +11,4 @@ security_group = '<EC2 security group to which your instance will be assigned>'
 subnet_id = '<VPC subnet ID in which your instance will be started>'
 instance_size = '<EC2 instance type, default to t2.micro>'
 shutdown_behavior = '<stop or termination, default to stop>'
+dry_run = <False or True>
