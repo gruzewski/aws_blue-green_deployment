@@ -116,7 +116,7 @@ def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, 
     """
     # Checks (by filtering instances currently running) if there is no other instance running with the same tags.
     instances = ec2_conn.get_only_instances(filters={"tag:Environment" : "{0}".format(''.join(env)),
-                                                     "instance-state-name" : "running"})
+                                                     "instance-state-name" : ["running", "pending"]})
 
     if not instances:
         # If list is not empty. Creates new instance.
@@ -171,9 +171,9 @@ def stop_instance(aws_connection, env, domain, live_alias, dry_run=False):
 
         result = True
     else:
-        logging.error('Couldnt stop old instance.')
+        logging.error('Couldnt stop the old instance. It looks like it is live. I tried to stop %s instance.' % env)
         if dry_run:
-            print('Instance %s would be stopped and tagged with Environment:%s' % (instances[0].id, tag))
+            print('Couldnt stop the old instance. It looks like it is live. I tried to stop %s instance.' % env)
 
     return result
 
@@ -189,6 +189,31 @@ def check_which_is_live(route53_conn, domain, live_alias):
     live_fqdn = route53_conn.get_zone(domain).get_a(live_alias).alias_dns_name
 
     return live_fqdn
+
+def swap_dns(live_alias, future_value, alias_dns_name, zone, records):
+    """
+    :description: Changes alias (blue.<domain> or green.<domain>) that is behind live url.
+    :param
+        live_alias: Your external DNS record pointing to live web server.
+        future_alias: blue.<domain> or green.<domain> depends which is going to be live.
+        zone: handle to zone that hosts dns records.
+        records: sets of dns records from the zone..
+    :return: Result of the change (AWS respond).
+    """
+    try:
+        change = records.add_change(action='UPSERT',
+                                    name=live_alias,
+                                    type='A',
+                                    alias_dns_name=alias_dns_name,
+                                    alias_hosted_zone_id=zone.id,
+                                    alias_evaluate_target_health=False)
+        change.add_value(future_value)
+        result = records.commit()
+    except Exception as ex:
+        print('Coudlnt swap dns entry for %s. Exception: %s' % (live_alias, ex))
+        logging.error('Coudlnt swap dns entry for %s. Exception %s' % (live_alias, ex))
+
+    return result
 
 def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry_run=False):
     """
@@ -219,24 +244,18 @@ def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry
     else:
         if current_live == blue_alias:
             # Blue was live so now time for Green.
-            change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=green_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-            change.add_value(green_alias)
-            result = records.commit()
-
-            # Wait TTL and then stop second instance
-            time.sleep(300)
-
-            stop_instance(aws_connection, 'blue', domain, live_alias, dry_run=dry_run)
+            result = swap_dns(live_alias, green_alias, green_alias, zone, records)
+            env_old = 'blue'
         else:
             # This time Green was live. Blue, are you ready?
-            change = records.add_change(action='UPSERT', name=live_alias, type='A', alias_dns_name=blue_alias, alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-            change.add_value(blue_alias)
-            result = records.commit()
+            result = swap_dns(live_alias, blue_alias, blue_alias, zone, records)
+            env_old = 'green'
 
-            # Wait TTL and then stop second instance
-            time.sleep(600)
+        # Wait TTL and then stop second instance
+        #time.sleep(300)
 
-            stop_instance(aws_connection, 'green', domain, live_alias, dry_run=dry_run)
+        stop_instance(aws_connection, env_old, domain, live_alias)
+
     return result
 
 def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, dry_run=False):
@@ -264,18 +283,20 @@ def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, dr
     else:
         if current_live == green_alias:
             # Green was live so we are assigning to Blue.
-            change = records.add_change(action='UPSERT', name=blue_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-            change.add_value(instance_public_ip)
-            result = records.commit()
+            result = swap_dns(blue_alias, instance_public_ip, None, zone, records)
+            #change = records.add_change(action='UPSERT', name=blue_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            #change.add_value(instance_public_ip)
+            #result = records.commit()
 
-            logging.debug(result)
+            #logging.debug(result)
         else:
             # Blue was live and Green is going to get new instance!
-            change = records.add_change(action='UPSERT', name=green_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
-            change.add_value(instance_public_ip)
-            result = records.commit()
+            result = swap_dns(green_alias, instance_public_ip, None, zone, records)
+            #change = records.add_change(action='UPSERT', name=green_alias, type='A', alias_hosted_zone_id=zone.id, alias_evaluate_target_health=False)
+            #change.add_value(instance_public_ip)
+            #result = records.commit()
 
-            logging.debug(result)
+            #logging.debug(result)
     return result
 
 def delete_old_instance(ec2_conn, old_tag, dry_run=False):
@@ -379,7 +400,7 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
 
                 if stg_instance[0].ip_address is None:
                     # Still not available so wait 10 seconds/
-                    time.sleep(10)
+                    time.sleep(5)
                     if counter is 6:
                         # Timeout.
                         logging.error('Cannot get Public IP from instance %s' % staging_instance[0].id)
