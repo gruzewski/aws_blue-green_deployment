@@ -60,20 +60,6 @@ AWS_METADATA = 'http://169.254.169.254/latest/meta-data/instance-id'
 log_path = '/var/log/'
 file_name = 'blue-green-deploy'
 
-# Log file. Always in /var/log!! It will log into the file and console
-logging.basicConfig(level=logging.WARN)
-logFormatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
-rootLogger = logging.getLogger()
-
-fileHandler = logging.FileHandler("{0}/{1}.log".format(log_path, file_name))
-fileHandler.setFormatter(logFormatter)
-rootLogger.addHandler(fileHandler)
-
-consoleHandler = logging.StreamHandler()
-consoleHandler.setFormatter(logFormatter)
-rootLogger.addHandler(consoleHandler)
-
-# Static variables
 blue_alias = 'blue' + '.' + domain
 green_alias = 'green' + '.' + domain
 old_tag = {'Environment': 'old-app'}
@@ -81,6 +67,24 @@ old_tag = {'Environment': 'old-app'}
 ############################################################
 #      Functions
 ############################################################
+
+
+def set_up_logging(log_path, file_name):
+    # Log file. Always in /var/log!! It will log into the file and console
+    logging.basicConfig(level=logging.WARN)
+    logFormatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
+    rootLogger = logging.getLogger()
+
+    fileHandler = logging.FileHandler("{0}/{1}.log".format(log_path, file_name))
+    fileHandler.setFormatter(logFormatter)
+    rootLogger.addHandler(fileHandler)
+
+    consoleHandler = logging.StreamHandler()
+    consoleHandler.setFormatter(logFormatter)
+    rootLogger.addHandler(consoleHandler)
+
+    return rootLogger
+
 
 def connect_to_AWS(region, aws_access_key, aws_secret_key):
     """
@@ -320,7 +324,7 @@ def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry
         # Wait TTL and then stop second instance
         #time.sleep(300)
 
-        stop_instance(aws_connection, env_old, domain, live_alias)
+        #stop_instance(aws_connection, env_old, domain, live_alias)
 
     return result
 
@@ -385,6 +389,7 @@ def roll_back(aws_conn, old_tag, domain, live_alias, dry_run=False):
             result = False
 
     return result
+
 
 def delete_old_instance(ec2_conn, old_tag, dry_run=False):
     """
@@ -483,13 +488,16 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
     else:
         env = 'blue'
 
+    past_live = get_env(live, domain)
+
     # 4. If deleted then we can create new instance
     if dry_run:
         # Dry Run
-        #create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
-        #assign_to_staging(aws_connections.get('route53'), domain, live, "127.0.0.1", dry_run)
-        #swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
-        roll_back(aws_connections, old_tag, domain, live_alias, False)
+        create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
+        assign_to_staging(aws_connections.get('route53'), domain, live, "127.0.0.1", dry_run)
+        swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
+        stop_instance(aws_connections, past_live, domain, live_alias, dry_run)
+        #roll_back(aws_connections, old_tag, domain, live_alias, False)
         sys.exit(0)
     elif deleted:
         staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
@@ -516,7 +524,11 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
 
         swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
 
+        stop_instance(aws_connections, past_live, domain, live_alias)
+
     return str(env + "." + domain + ": " + public_ip)
+
+rootLogger = set_up_logging(log_path, file_name)
 
 print(deployment_stage(region, aws_access_key, aws_secret_key, web_srv_name, domain, live_alias, blue_alias, green_alias,
                  old_tag, image_id, ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior, dry_run))
