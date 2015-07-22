@@ -1,5 +1,7 @@
 __author__ = 'jacek gruzewski'
 
+#!/user/bin/python3.4
+
 """
 To do: through exceptions rather than calling sys.exit(1)
 """
@@ -13,46 +15,14 @@ import time
 import sys
 import logging
 import os
+import requests
 
 # AWS Boto library
 from boto import ec2, route53, exception
 
-# Config file imports
-import aws_config
-
-try:
-    # Checking if all attributes were set.
-    region = getattr(aws_config, "region")
-    aws_access_key = getattr(aws_config, "access_key")
-    aws_secret_key = getattr(aws_config, "secret_key")
-    web_srv_name = getattr(aws_config, "instance_name")
-    domain = getattr(aws_config, "domain")
-    live_alias = getattr(aws_config, "live_record_name") + "." + domain
-    image_id = getattr(aws_config, "ami_id")
-    ssh_key = getattr(aws_config, "key_pair")
-    sec_group = getattr(aws_config, "security_group")
-    subnet_id = getattr(aws_config, "subnet_id")
-    instance_size = getattr(aws_config, "instance_size")
-    shutdown_behavior = getattr(aws_config, "shutdown_behavior")
-    dry_run = getattr(aws_config, "dry_run")
-except AttributeError as at_err:
-    # Falling back to local variables. Worth to try!
-    logging.error('Couldnt read parameters from aws_config.py file. [%s]', at_err)
-    region = os.environ['AWS_DEFAULT_REGION']
-    aws_access_key = os.environ['AWS_ACCESS_KEY_ID']
-    aws_secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
-
-    if region is None or aws_access_key is None or aws_secret_key is None:
-        # At least we tried.
-        logging.error('Couldnt find AWS credentials in local variables')
-        sys.exit(1)
-    else:
-        logging.info('Got AWS credentials from local variables')
-
-
-############################################################
+#####################################################################
 #      Static data and configuration
-############################################################
+#####################################################################
 
 # Static AWS Rest service for getting instance details
 AWS_METADATA = 'http://169.254.169.254/latest/meta-data/instance-id'
@@ -60,33 +30,66 @@ AWS_METADATA = 'http://169.254.169.254/latest/meta-data/instance-id'
 log_path = '/var/log/'
 file_name = 'blue-green-deploy'
 
-blue_alias = 'blue' + '.' + domain
-green_alias = 'green' + '.' + domain
-old_tag = {'Environment': 'old-app'}
-
-############################################################
+#####################################################################
 #      Functions
-############################################################
+#####################################################################
 
 
-def set_up_logging(log_path, file_name):
+def read_config_file(logger):
+    # Config file imports
+    import aws_config
+
+    try:
+        # Checking if all attributes were set.
+
+        domain = getattr(aws_config, "domain")
+
+        config = {
+         'reg': getattr(aws_config, "region"),
+         'access': getattr(aws_config, "access_key"),
+         'secret': getattr(aws_config, "secret_key"),
+         'srv': getattr(aws_config, "instance_name"),
+         'domain': domain,
+         'alias': getattr(aws_config, "live_record_name") + "." + domain,
+         'image': getattr(aws_config, "ami_id"),
+         'key': getattr(aws_config, "key_pair"),
+         'sec': [getattr(aws_config, "security_group")],
+         'subnet': getattr(aws_config, "subnet_id"),
+         'type': getattr(aws_config, "instance_size"),
+         'shutdown': getattr(aws_config, "shutdown_behavior"),
+         'dry-run': getattr(aws_config, "dry_run")
+         }
+    except AttributeError as at_err:
+        # Falling back to local variables. Worth to try!
+        logger.error('Could not read parameters from aws_config.py file. [%s]', at_err)
+        region = os.environ['AWS_DEFAULT_REGION']
+        aws_access_key = os.environ['AWS_ACCESS_KEY_ID']
+        aws_secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
+
+        if region is None or aws_access_key is None or aws_secret_key is None:
+            # At least we tried.
+            logger.error('Could not find AWS credentials in local variables')
+            sys.exit(1)
+        else:
+            logger.info('Got AWS credentials from local variables')
+
+    return config
+
+
+def set_up_logging(path, file):
     # Log file. Always in /var/log!! It will log into the file and console
     logging.basicConfig(level=logging.WARN)
-    logFormatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
-    rootLogger = logging.getLogger()
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
+    root_logger = logging.getLogger()
 
-    fileHandler = logging.FileHandler("{0}/{1}.log".format(log_path, file_name))
-    fileHandler.setFormatter(logFormatter)
-    rootLogger.addHandler(fileHandler)
+    file_handler = logging.FileHandler("{0}/{1}.log".format(path, file))
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
 
-    consoleHandler = logging.StreamHandler()
-    consoleHandler.setFormatter(logFormatter)
-    rootLogger.addHandler(consoleHandler)
-
-    return rootLogger
+    return root_logger
 
 
-def connect_to_AWS(region, aws_access_key, aws_secret_key):
+def connect_to_aws(region, aws_access_key, aws_secret_key):
     """
     :param:
         region: AWS region
@@ -133,7 +136,8 @@ def get_specific_instances(ec2_conn, tag_key, tag_value, instance_state):
     return instances
 
 
-def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, instance_name, user_data=None, instance_size='t2.micro', shutdown_behavior='stop', dry_run=False):
+def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, instance_name, user_data=None,
+                        instance_size='t2.micro', shutdown='stop', dry_run=False):
     """
     :param
         ec2_conn: connection to AWS EC2 service
@@ -156,31 +160,39 @@ def create_new_instance(ec2_conn, image_id, ssh_key, sec_group, subnet_id, env, 
         # If list is not empty. Creates new instance.
         try:
             reservations = ec2_conn.run_instances(image_id,
-                                           key_name=ssh_key,
-                                           user_data=user_data,
-                                           instance_type=instance_size,
-                                           subnet_id=subnet_id,
-                                           security_group_ids=[sec_group],
-                                           instance_initiated_shutdown_behavior=shutdown_behavior,
-                                           dry_run=dry_run)
+                                                  key_name=ssh_key,
+                                                  user_data=user_data,
+                                                  instance_type=instance_size,
+                                                  subnet_id=subnet_id,
+                                                  security_group_ids=sec_group,
+                                                  instance_initiated_shutdown_behavior=shutdown,
+                                                  dry_run=dry_run)
 
             if reservations is not None and not dry_run:
                 # When instance was created, we have to assign tags.
-                reservations.instances[0].add_tag('Name', instance_name)
-                reservations.instances[0].add_tag('Environment', env)
-                reservations.instances[0].add_tag('Deployment Date', time.strftime("%d-%m-%Y"))
+                tag_new_instance(reservations.instances[0], instance_name, env)
+            else:
+                LOGGER.error('Something went wrong when creating new instance.')
+                sys.exit(1)
         except exception.EC2ResponseError:
             if dry_run:
-                rootLogger.warn('New instance would be created and this tags should be assigned')
-                rootLogger.warn('Name: %s' % instance_name)
-                rootLogger.warn('Environment: %s' % env)
-                rootLogger.warn('Deployment Date: %s' % time.strftime("%d-%m-%Y"))
+                LOGGER.warn('New instance would be created and this tags should be assigned')
+                LOGGER.warn('Name: %s' % instance_name)
+                LOGGER.warn('Environment: %s' % env)
+                LOGGER.warn('Deployment Date: %s' % time.strftime("%d-%m-%Y"))
                 return 'OK'
             else:
-                rootLogger.error('Something went wrong when creating new instance.')
+                LOGGER.error('Something went wrong when creating new instance.')
+
+                try:
+                    # Last chance - waiting 1 minute to tag instance.
+                    time.sleep(60)
+                    tag_new_instance(reservations.instances[0], instance_name, env)
+                except exception.EC2ResponseError:
+                    sys.exit(1)
     else:
         # Looks like there was another instance running with the same tags.
-        rootLogger.warn('There is another instance running with %s environment tag (id: %s).' % (env, instances[0]))
+        LOGGER.warn('There is another instance running with %s environment tag (id: %s).' % (env, instances[0]))
         return None
 
     return reservations.instances
@@ -193,13 +205,27 @@ def tag_instance(instance, tag_name, tag_key):
         instance: Instance that should be tagged.
         tag_name: Name of the tag.
         tag_key: Value of the tag.
-    :return: boolean result.
+    :return: None
     """
     instance.remove_tag('{0}'.format(tag_name))
     instance.add_tag('{0}'.format(tag_name), '{0}'.format(tag_key))
 
 
-def stop_instance(aws_connection, env, domain, live_alias, dry_run=False):
+def tag_new_instance(instance, instance_name, environment):
+    """
+    :description: Tags new instance.
+    :param
+        instance: Instance that should be tagged.
+        instance_name: Name of the instance.
+        environment: blue org green.
+    :return: None
+    """
+    instance.add_tag('Name', instance_name)
+    instance.add_tag('Environment', environment)
+    instance.add_tag('Deployment Date', time.strftime("%d-%m-%Y"))
+
+
+def stop_instance(aws_connection, env, domain, live_alias, tag, dry_run=False):
     """
     :description: Stops past live instance.
     :param
@@ -212,7 +238,7 @@ def stop_instance(aws_connection, env, domain, live_alias, dry_run=False):
     """
     result = False
 
-    tag = ''.join(old_tag.values())
+    tag = ''.join(tag.values())
 
     # Gets past live instance.
     instances = get_specific_instances(aws_connection.get('ec2'), "Environment", env, "running")
@@ -223,15 +249,15 @@ def stop_instance(aws_connection, env, domain, live_alias, dry_run=False):
             aws_connection.get('ec2').stop_instances(instance_ids=[instances[0].id], dry_run=dry_run)
             tag_instance(instances[0], 'Environment', tag)
         except exception.EC2ResponseError:
-            rootLogger.warn('Instance %s would be stopped and tagged with Environment:%s' % (instances[0].id, tag))
+            LOGGER.warn('Instance %s would be stopped and tagged with Environment:%s' % (instances[0].id, tag))
 
         result = True
     else:
         if dry_run:
-            rootLogger.warning('Old instance with tag %s would be stopped.' % env)
+            LOGGER.warning('Old instance with tag %s would be stopped.' % env)
         else:
-            rootLogger.error('Could not stop the old instance. It looks like it is live or doesnt exist. '
-                             'I tried to stop %s instance.' % env)
+            LOGGER.error('Could not stop the old instance. It looks like it is live or doesnt exist. '
+                         'I tried to stop %s instance.' % env)
 
     return result
 
@@ -276,6 +302,7 @@ def swap_dns(live_alias, future_value, alias_dns_name, zone, records):
     try:
         change = records.add_change(action='UPSERT',
                                     name=live_alias,
+                                    ttl=300,
                                     type='A',
                                     alias_dns_name=alias_dns_name,
                                     alias_hosted_zone_id=zone.id,
@@ -283,12 +310,13 @@ def swap_dns(live_alias, future_value, alias_dns_name, zone, records):
         change.add_value(future_value)
         result = records.commit()
     except Exception as ex:
-        rootLogger.error('Could not swap dns entry for %s. Exception: %s' % (live_alias, ex))
+        LOGGER.error('Could not swap dns entry for %s. Exception: %s' % (live_alias, ex))
+        sys.exit(1)
 
     return result
 
 
-def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry_run=False):
+def swap_live_with_staging(aws_connection, domain, current_live, live_alias, blue_alias, green_alias, dry_run=False):
     """
     :description: Changes alias (blue.<domain> or green.<domain>) that is behind live url.
     :param
@@ -307,29 +335,28 @@ def swap_live_with_staging(aws_connection, domain, current_live, live_alias, dry
 
     if dry_run:
         # Dry run
-        rootLogger.warn('DNS record %s would be updated with %s' % (live_alias, current_live))
-        stop_instance(aws_connection, 'blue' if current_live == blue_alias else 'green', domain, live_alias, dry_run=dry_run)
+        LOGGER.warn('DNS record %s would be updated with %s' %
+                    (live_alias, green_alias if current_live == blue_alias else blue_alias))
 
         result = 'OK'
     else:
         if current_live == blue_alias:
             # Blue was live so now time for Green.
-            result = swap_dns(live_alias, green_alias, green_alias, zone, records)
-            env_old = 'blue'
+            if simple_check(green_alias):
+                result = swap_dns(live_alias, green_alias, green_alias, zone, records)
+            else:
+                LOGGER.error('Staging is not running.')
+                sys.exit(1)
+
         else:
             # This time Green was live. Blue, are you ready?
             result = swap_dns(live_alias, blue_alias, blue_alias, zone, records)
-            env_old = 'green'
-
-        # Wait TTL and then stop second instance
-        #time.sleep(300)
-
-        #stop_instance(aws_connection, env_old, domain, live_alias)
 
     return result
 
 
-def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, dry_run=False):
+def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, live_alias, blue_alias, green_alias,
+                      dry_run=False):
     """
     :description: Assigns newly created instance to staging url
     :param
@@ -345,53 +372,17 @@ def assign_to_staging(route53_conn, domain, current_live, instance_public_ip, dr
     records = route53.record.ResourceRecordSets(connection=route53_conn, hosted_zone_id=zone.id)
 
     if dry_run:
-        rootLogger.warn('Public IP %s would be assigned to %s' % (instance_public_ip, live_alias))
+        LOGGER.warn('Public IP %s would be assigned to %s' % (instance_public_ip, live_alias))
 
         result = 'OK'
     else:
-        result = swap_dns(blue_alias if current_live == green_alias else green_alias, instance_public_ip, None, zone, records)
+        result = swap_dns(blue_alias if current_live == green_alias else green_alias, instance_public_ip, None, zone,
+                          records)
 
     return result
 
 
-def roll_back(aws_conn, old_tag, domain, live_alias, dry_run=False):
-    """
-    :description: Rolls back deployment by starting instance with old-app tag and swapping dns entry.
-    :param
-        ec2_conn: Connection to AWS EC2 service
-        old_tag: Dictionary with <tag_name> <tag_value> pair
-        dry-run: True or False. If True, it will not make any changes.
-    :return: boolean status
-    """
-    result = True
-
-    old_instance = get_specific_instances(aws_conn.get('ec2'), ''.join(old_tag.keys()), ''.join(old_tag.values()), ['stopped', 'running'])
-    current_live = check_which_is_live(aws_conn.get('route53'), domain, live_alias)
-    env = get_env(current_live, domain)
-
-    if not old_instance:
-        rootLogger.error('No instance with tag %s was found. No chance to roll back Sir!' % ''.join(old_tag.values()))
-    else:
-        try:
-            if dry_run:
-                rootLogger.warning('Instance %s would be started and tagged with %s' % (old_instance, env))
-            else:
-                old_instance[0].start()
-                tag_instance(old_instance[0], 'Environment', 'blue' if env == 'green' else 'green')
-
-            instance_public_ip = wait_for_public_ip(aws_conn.get('ec2'), old_instance[0].id)
-
-            assign_to_staging(aws_conn.get('route53'), domain, current_live, instance_public_ip, dry_run=False)
-            swap_live_with_staging(aws_conn, domain, current_live, live_alias, dry_run)
-            stop_instance(aws_conn, env, domain, live_alias, dry_run)
-        except exception.EC2ResponseError:
-            rootLogger.error('Could not start %s instance.' % old_instance)
-            result = False
-
-    return result
-
-
-def delete_old_instance(ec2_conn, old_tag, dry_run=False):
+def delete_old_instance(ec2_conn, tag, dry_run=False):
     """
     :description: Deletes instance for given tag only if it is stopped
     :param
@@ -403,41 +394,52 @@ def delete_old_instance(ec2_conn, old_tag, dry_run=False):
     result = False
 
     # Filters instances with tag Environment = old-app and only in stopped state.
-    instances = get_specific_instances(ec2_conn, ''.join(old_tag.keys()), ''.join(old_tag.values()), "stopped")
+    instances = get_specific_instances(ec2_conn, ''.join(tag.keys()), ''.join(tag.values()), "stopped")
 
     if len(instances) is 1:
         # If there is only 1 instance in that state.
         old = instances[0]
 
-        rootLogger.debug("I am going to delete %s" % old.id)
+        LOGGER.debug("I am going to delete %s" % old.id)
         try:
             deleted_old = ec2_conn.terminate_instances(instance_ids=[old.id], dry_run=dry_run)
 
             # Previous line should return instance that was deleted. Worth to check if it was the one we want to delete.
             if deleted_old[0].id == old.id:
-                rootLogger.info('Deleted %s' % deleted_old[0].id)
+                LOGGER.info('Deleted %s' % deleted_old[0].id)
                 result = True
         except exception.EC2ResponseError as ex:
-            rootLogger.error('Instance %s would be deleted.' % old.id)
-            rootLogger.error(ex)
+            if dry_run:
+                LOGGER.error('Instance %s would be deleted.' % old.id)
+            else:
+                LOGGER.error('Something went wrong when deleting old instance.')
+
+            LOGGER.error(ex)
     else:
         # It could be none or multiple instance in that state. Better notify before someone starts complaining.
-        rootLogger.warn('No old instance or more than 1 instance was found. I hope you are aware of that. Continue.')
+        LOGGER.warn('No old instance or more than 1 instance was found. I hope you are aware of that. Continue.')
         result = True  # I am returning true because it shouldn't be a big issue
 
     return result
 
 
 def wait_for_public_ip(ec2_conn, instance_id):
+    """
+    :description: Gets instance's Public IP. Retries every 5 seconds for 30 seconds.
+    :param
+        ec2_conn: Connection to AWS EC2 service
+        instance_id: ID of instance :)
+    :return: Public IP or exits the script
+    """
     counter = 0
 
-    while counter < 6:
-        # We are going to check every 5 seconds for 30 seconds.
+    while counter < 24:
+        # We are going to check every 10 seconds for 2 minutes.
         stg_instance = ec2_conn.get_only_instances(instance_ids=[instance_id])
 
         if stg_instance[0].ip_address is None:
             # Still not available so wait 5 seconds.
-            time.sleep(5)
+            time.sleep(10)
         else:
             # We got it!
             public_ip = stg_instance[0].ip_address
@@ -446,14 +448,110 @@ def wait_for_public_ip(ec2_conn, instance_id):
         counter += 1
 
     # Unfortunately we couldn't get Public IP so logging and exiting.
-    rootLogger.error('Cannot get Public IP from instance %s' % stg_instance[0].id)
+    stg_instance = ec2_conn.get_only_instances(instance_ids=[instance_id])
+    LOGGER.error('Cannot get Public IP from instance %s' % stg_instance[0].id)
     sys.exit(1)
 
-    return None
+
+def simple_check(url):
+    """
+    :description: Checks if given url is returning 200 respond code for 10 minutes in 60 seconds intervals.
+    :param
+        url: link which should be checked
+    :return: Boolean
+    """
+
+    counter = 0
+
+    while counter < 10:
+        try:
+            r = requests.head('http://' + url)
+            LOGGER.debug(r.status_code)
+            if r.status_code == 200:
+                return True
+            else:
+                time.sleep(60)
+        except requests.ConnectionError:
+            LOGGER.error("Failed to get respond code from %s - attempt #%s" % (url, counter + 1))
+
+    return False
 
 
-def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, blue_url, green_url, old_tag, image_id,
-                     ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior, dry_run=False):
+def switch(region, access_key, secret_key, tag, domain, live_url, blue_alias, green_alias, dry_run=False):
+    """
+    :description: Rolls back deployment by starting instance with old-app tag and swapping dns entry.
+    :param
+        ec2_conn: Connection to AWS EC2 service
+        old_tag: Dictionary with <tag_name> <tag_value> pair
+        dry-run: True or False. If True, it will not make any changes.
+    :return: boolean status
+    """
+    result = True
+
+    # 1. Connects to AWS
+    aws_conn = connect_to_aws(region, access_key, secret_key)
+
+    # 2. Check which is live at the moment and which should be stopped.
+    live = check_which_is_live(aws_conn.get('route53'), domain, live_url)
+
+    # 3. Swap DNS
+    result = swap_live_with_staging(aws_conn, domain, live, live_url, blue_alias, green_alias, dry_run)
+
+    # 4. Stop and tag old one. We will do it after 5 minutes to give chance to safely close all connections.
+    time.sleep(300)
+    stop_instance(aws_conn, get_env(live, domain), domain, live_url, tag, dry_run)
+
+    return result
+
+
+def roll_back(region, access_key, secret_key, tag, domain, live_alias, blue_alias, green_alias, dry_run=False):
+    """
+    :description: Rolls back deployment by starting instance with old-app tag and swapping dns entry.
+    :param
+        ec2_conn: Connection to AWS EC2 service
+        old_tag: Dictionary with <tag_name> <tag_value> pair
+        dry-run: True or False. If True, it will not make any changes.
+    :return: boolean status
+    """
+    result = True
+
+    # 1. Connects to AWS
+    aws_conn = connect_to_aws(region, access_key, secret_key)
+
+    # 2. Get instance ID of old instance. Check which environment is live.
+    old_instance = get_specific_instances(aws_conn.get('ec2'), ''.join(tag.keys()), ''.join(tag.values()),
+                                          ['stopped', 'running'])
+    current_live = check_which_is_live(aws_conn.get('route53'), domain, live_alias)
+    env = get_env(current_live, domain)
+
+    # 3. Do the Magic ;)
+    if not old_instance:
+        LOGGER.error('No instance with tag %s was found. No chance to roll back Sir!' % ''.join(tag.values()))
+    else:
+        try:
+            if dry_run:
+                LOGGER.warning('Instance %s would be started and tagged with %s' % (old_instance, env))
+            else:
+                # Start old instance
+                old_instance[0].start()
+                tag_instance(old_instance[0], 'Environment', 'blue' if env == 'green' else 'green')
+
+            # Refresh its public IP as it could change.
+            instance_public_ip = wait_for_public_ip(aws_conn.get('ec2'), old_instance[0].id)
+
+            assign_to_staging(aws_conn.get('route53'), domain, current_live, instance_public_ip, live_alias,
+                              blue_alias, green_alias, dry_run=False)
+            swap_live_with_staging(aws_conn, domain, current_live, live_alias, blue_alias, green_alias, dry_run)
+            stop_instance(aws_conn, env, domain, live_alias, tag, dry_run)
+        except exception.EC2ResponseError:
+            LOGGER.error('Could not start %s instance.' % old_instance)
+            result = False
+
+    return result
+
+
+def deployment_stage(region, access_key, secret_key, srv_name, domain, live_url, blue_alias, green_alias, tag, image_id,
+                     ssh_key, sec_group, subnet_id, instance_size, shutdown, dry_run=False):
     """
     :description: Delivers new instance with staging dns (blue / green).
     :param
@@ -476,36 +574,35 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
     :return: string with url and ip address to staging server
     """
     # 1. Connects to AWS
-    aws_connections = connect_to_AWS(region, acces_key, secret_key)
+    aws_connections = connect_to_aws(region, access_key, secret_key)
 
     # 2. Delete old instance which should be stopped
-    deleted = delete_old_instance(aws_connections.get('ec2'), old_tag, dry_run)
+    deleted = delete_old_instance(aws_connections.get('ec2'), tag, dry_run)
 
     # 3. Check which environment (blue/green) is live
     live = check_which_is_live(aws_connections.get('route53'), domain, live_url)
-    if live == blue_url:
+    if live == blue_alias:
         env = 'green'
     else:
         env = 'blue'
 
-    past_live = get_env(live, domain)
-
     # 4. If deleted then we can create new instance
     if dry_run:
         # Dry Run
-        create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
-        assign_to_staging(aws_connections.get('route53'), domain, live, "127.0.0.1", dry_run)
-        swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
-        stop_instance(aws_connections, past_live, domain, live_alias, dry_run)
-        #roll_back(aws_connections, old_tag, domain, live_alias, False)
+        create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None,
+                            instance_size, shutdown, dry_run)
+        assign_to_staging(aws_connections.get('route53'), domain, live, "127.0.0.1", live_url, blue_alias,
+                          green_alias, dry_run)
+
         sys.exit(0)
     elif deleted:
-        staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env, srv_name, None, instance_size, shutdown_behavior, dry_run)
+        staging_instance = create_new_instance(aws_connections.get('ec2'), image_id, ssh_key, sec_group, subnet_id, env,
+                                               srv_name, None, instance_size, shutdown, dry_run)
 
     # 5. Assign right dns alias only if we managed to create instance in previous step
     if staging_instance is None:
         # There were some problems with creating new instance
-        rootLogger.error('Could not create new instance.')
+        LOGGER.error('Could not create new instance.')
         sys.exit(1)
     else:
         # Everything was all right. Waiting for Public IP
@@ -514,21 +611,15 @@ def deployment_stage(region, acces_key, secret_key, srv_name, domain, live_url, 
             public_ip = wait_for_public_ip(aws_connections.get('ec2'), staging_instance[0].id)
 
             if public_ip is None:
-                rootLogger.error('Cannot get Public IP from instance %s' % staging_instance[0].id)
+                LOGGER.error('Cannot get Public IP from instance %s' % staging_instance[0].id)
                 sys.exit(1)
         else:
             # Or maybe it is? :)
             public_ip = staging_instance[0].ip_address
 
-        assign_to_staging(aws_connections.get('route53'), domain, live, public_ip, dry_run)
-
-        swap_live_with_staging(aws_connections, domain, live, live_url, dry_run)
-
-        stop_instance(aws_connections, past_live, domain, live_alias)
+        assign_to_staging(aws_connections.get('route53'), domain, live, public_ip, live_url, blue_alias, green_alias,
+                          dry_run)
 
     return str(env + "." + domain + ": " + public_ip)
 
-rootLogger = set_up_logging(log_path, file_name)
-
-print(deployment_stage(region, aws_access_key, aws_secret_key, web_srv_name, domain, live_alias, blue_alias, green_alias,
-                 old_tag, image_id, ssh_key, sec_group, subnet_id, instance_size, shutdown_behavior, dry_run))
+LOGGER = set_up_logging(log_path, file_name)
