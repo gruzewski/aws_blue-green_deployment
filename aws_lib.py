@@ -342,15 +342,19 @@ def swap_live_with_staging(aws_connection, domain, current_live, live_alias, blu
     else:
         if current_live == blue_alias:
             # Blue was live so now time for Green.
-            if simple_check(green_alias):
+            #if simple_check(green_alias):
                 result = swap_dns(live_alias, green_alias, green_alias, zone, records)
-            else:
-                LOGGER.error('Staging is not running.')
-                sys.exit(1)
+            #else:
+            #    LOGGER.error('Staging is not running.')
+            #    sys.exit(1)
 
         else:
             # This time Green was live. Blue, are you ready?
-            result = swap_dns(live_alias, blue_alias, blue_alias, zone, records)
+            #if simple_check(blue_alias):
+                result = swap_dns(live_alias, blue_alias, blue_alias, zone, records)
+            #else:
+            #    LOGGER.error('Staging is not running.')
+            #    sys.exit(1)
 
     return result
 
@@ -475,6 +479,11 @@ def simple_check(url):
             LOGGER.error("Failed to get respond code from %s - attempt #%s" % (url, counter + 1))
 
     return False
+
+
+def write_to_file(to_write):
+    f = open('parameters.properties', 'w')
+    f.write(to_write)
 
 
 def switch(region, access_key, secret_key, tag, domain, live_url, blue_alias, green_alias, dry_run=False):
@@ -619,6 +628,8 @@ def deployment_stage(region, access_key, secret_key, srv_name, domain, live_url,
 
         assign_to_staging(aws_connections.get('route53'), domain, live, public_ip, live_url, blue_alias, green_alias,
                           dry_run)
+
+        write_to_file("staging-server = " + public_ip)
 
     return str(env + "." + domain + ": " + public_ip)
 
