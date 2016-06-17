@@ -3,7 +3,7 @@ __author__ = 'jacek gruzewski'
 #!/user/bin/python3.4
 
 """
-To do: through exceptions rather than calling sys.exit(1)
+To do: throw exceptions rather than calling sys.exit(1)
 """
 
 ############################################################
